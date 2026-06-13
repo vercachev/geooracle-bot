@@ -3,7 +3,6 @@ import os
 import re
 import math
 import urllib.request
-import urllib.parse
 import json
 import logging
 import time
@@ -23,7 +22,7 @@ if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY not set!")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-JUDGE_MODEL = "google/gemini-2.0-flash-exp:free"
+JUDGE_MODEL = "google/gemma-4-31b-it:free"
 
 AGENTS = [
     {
@@ -31,7 +30,7 @@ AGENTS = [
         "name": "Архитектор",
         "emoji": "🏛️",
         "role": "Архитектура и городская среда",
-        "model": "meta-llama/llama-3.2-90b-vision-instruct:free",
+        "model": "google/gemma-4-31b-it:free",
         "focus": (
             "Ты — эксперт по АРХИТЕКТУРЕ и ГОРОДСКОЙ СРЕДЕ. Твоя специализация:\n"
             "• Стили зданий, материалы фасадов, типовая застройка по регионам\n"
@@ -46,7 +45,7 @@ AGENTS = [
         "name": "Натуралист",
         "emoji": "🌿",
         "role": "Природа и ландшафт",
-        "model": "google/gemini-2.0-flash-exp:free",
+        "model": "google/gemma-4-26b-a4b:free",
         "focus": (
             "Ты — эксперт по ПРИРОДЕ и ЛАНДШАФТУ. Твоя специализация:\n"
             "• Тип растительности (тропики/умеренный/пустыня/тайга), породы деревьев\n"
@@ -61,7 +60,7 @@ AGENTS = [
         "name": "Культуролог",
         "emoji": "🚃",
         "role": "Культура и транспорт",
-        "model": "qwen/qwen2.5-vl-7b-instruct:free",
+        "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
         "focus": (
             "Ты — эксперт по КУЛЬТУРЕ и ТРАНСПОРТУ. Твоя специализация:\n"
             "• Письменность и язык на вывесках (кириллица, латиница, иероглифы, арабский)\n"
@@ -76,7 +75,7 @@ AGENTS = [
         "name": "Детектив",
         "emoji": "🔧",
         "role": "Инфраструктура и детали",
-        "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "model": "nvidia/nemotron-nano-12b-v2-vl:free",
         "focus": (
             "Ты — эксперт по ИНФРАСТРУКТУРЕ и МЕЛКИМ ДЕТАЛЯМ. Твоя специализация:\n"
             "• Столбы (дырки, основания, форма), болларды (цвет, форма)\n"
@@ -95,7 +94,7 @@ OUTPUT_FORMAT = (
     "🔍 АРГУМЕНТЫ: [2-4 коротких ключевых наблюдения именно по твоей специализации]\n"
     "COORDS: lat, lon\n\n"
     "ВАЖНО: строка COORDS обязательна и должна содержать численные координаты "
-    "(широта, долгота) твоей лучшей догадки, например: COORDS: 48.8566, 2.3522"
+    "(широта, долгота), например: COORDS: 48.8566, 2.3522"
 )
 
 HINTS_TEXT = """💡 Гайд по визуальной геолокации (метод Rainbolt)
@@ -118,7 +117,6 @@ HINTS_TEXT = """💡 Гайд по визуальной геолокации (м
 🛣️ Разметка: жёлтые линии → Америка/Азия, белые → Европа"""
 
 user_mode = {}
-
 
 def tg_request(method, data):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -145,7 +143,6 @@ def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="Markd
         return tg_request("editMessageText", data)
     except Exception as e:
         logger.error(f"edit_message error: {e}")
-        return None
 
 def answer_callback(callback_id):
     try:
@@ -170,7 +167,6 @@ def result_keyboard(lat=None, lon=None):
         rows.append([{"text": "🗺️ Открыть на карте", "url": maps_url}])
     rows.append([{"text": "◀️ Главное меню", "callback_data": "back"}])
     return {"inline_keyboard": rows}
-
 
 def call_openrouter(model, messages, max_tokens=900, timeout=120):
     payload = json.dumps({
@@ -198,7 +194,6 @@ def fetch_image_b64(file_id):
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     with urllib.request.urlopen(file_url, timeout=60) as r:
         return base64.b64encode(r.read()).decode()
-
 
 COORDS_RE = re.compile(r"COORDS\s*[:：]?\s*\(?\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)", re.IGNORECASE)
 
@@ -239,7 +234,6 @@ def strip_coords_line(text):
     lines = [ln for ln in text.splitlines() if not ln.strip().upper().startswith("COORDS")]
     return "\n".join(lines).strip()
 
-
 def agent_system_prompt(agent):
     return (
         f"Ты — агент-специалист команды GeoOracle по определению геолокации по фотографии.\n"
@@ -259,8 +253,8 @@ def run_agent(agent, image_b64, mode, others_text=None, round_num=1):
         user_text = (
             "Это РАУНД ДЕБАТОВ. Ниже — мнения других агентов-специалистов по этому же фото:\n\n"
             f"{others_text}\n\n"
-            "Изучи их аргументы. Если они убедительны и противоречат твоей версии — "
-            "скорректируй свою оценку. Если уверен в своей версии — отстаивай её с аргументами. "
+            "Изучи их аргументы. Если они убедительны — скорректируй свою оценку. "
+            "Если уверен в своей версии — отстаивай её с аргументами. "
             "Дай ОБНОВЛЁННУЮ оценку в том же формате."
         )
     messages = [
@@ -306,7 +300,6 @@ def build_others_map(results):
         others_map[agent["id"]] = "\n\n".join(chunks) if chunks else "Другие агенты не дали ответа."
     return others_map
 
-
 JUDGE_SYSTEM = (
     "Ты — ГЛАВНЫЙ СУДЬЯ команды GeoOracle по геолокации. "
     "Перед тобой выступили 4 агента-специалиста (архитектура, природа, культура/транспорт, "
@@ -344,7 +337,7 @@ def run_judge(image_b64, all_rounds_text, mode):
 def build_protocol(rounds):
     parts = []
     for rnum, results in rounds:
-        parts.append(f"=== РАУНД {rnum} ===")
+        parts.append(f"═══ РАУНД {rnum} ═══")
         for r in results:
             a = r["agent"]
             if r["text"]:
@@ -355,7 +348,6 @@ def build_protocol(rounds):
                 parts.append(f"{a['emoji']} {a['name']} ({a['role']}): [нет ответа]")
         parts.append("")
     return "\n".join(parts)
-
 
 def short_location(text):
     if not text:
@@ -379,29 +371,28 @@ def short_confidence(text):
 
 def format_debate_summary(rounds):
     final_round = rounds[-1][1]
-    lines = ["Дебаты агентов (итоговые позиции):", ""]
+    lines = ["🗣️ *Дебаты агентов* (итоговые позиции):", ""]
     for r in final_round:
         a = r["agent"]
         if r["text"]:
             loc = short_location(r["text"])
             conf = short_confidence(r["text"])
             conf_str = f" — {conf}%" if conf else ""
-            lines.append(f"{a['emoji']} {a['name']}: {loc}{conf_str}")
+            lines.append(f"{a['emoji']} *{a['name']}*: {loc}{conf_str}")
         else:
-            lines.append(f"{a['emoji']} {a['name']}: недоступен")
+            lines.append(f"{a['emoji']} *{a['name']}*: ⚠️ недоступен")
     return "\n".join(lines)
-
 
 def run_debate(image_b64, mode, progress_cb=None):
     rounds = []
 
     if progress_cb:
-        progress_cb("Раунд 1/3: агенты дают независимые оценки...")
+        progress_cb("🧠 *Раунд 1/3*: агенты дают независимые оценки...")
     r1 = run_round_parallel(image_b64, mode, round_num=1)
     rounds.append((1, r1))
 
     if progress_cb:
-        progress_cb("Раунд 2/3: агенты видят чужие аргументы и корректируют позиции...")
+        progress_cb("🔄 *Раунд 2/3*: агенты видят чужие аргументы и корректируют позиции...")
     others_map = build_others_map(r1)
     r2 = run_round_parallel(image_b64, mode, others_map=others_map, round_num=2)
     rounds.append((2, r2))
@@ -411,13 +402,13 @@ def run_debate(image_b64, mode, progress_cb=None):
     logger.info(f"Disagreement after round 2: {disagreement:.0f} km")
     if disagreement > 150:
         if progress_cb:
-            progress_cb(f"Раунд 3/3: сильные расхождения (~{int(disagreement)} км), финальная корректировка...")
+            progress_cb(f"⚡ *Раунд 3/3*: расхождение ~{int(disagreement)} км, финальная корректировка...")
         others_map3 = build_others_map(r2)
         r3 = run_round_parallel(image_b64, mode, others_map=others_map3, round_num=3)
         rounds.append((3, r3))
 
     if progress_cb:
-        progress_cb("Судья анализирует все аргументы и выносит вердикт...")
+        progress_cb("⚖️ *Судья* анализирует все аргументы и выносит вердикт...")
     protocol = build_protocol(rounds)
     try:
         verdict = run_judge(image_b64, protocol, mode)
@@ -427,27 +418,26 @@ def run_debate(image_b64, mode, progress_cb=None):
 
     return rounds, verdict
 
-
 def process_photo(chat_id, file_id, mode):
-    mode_text = "GeoGuessr" if mode == "geo" else "OSINT"
-    sent = send_message(chat_id, f"{mode_text} | Запускаю Multi-Agent Debate...", parse_mode=None)
+    mode_text = "🎮 GeoGuessr" if mode == "geo" else "🔍 OSINT"
+    sent = send_message(chat_id, f"{mode_text} | 👁️ Запускаю Multi-Agent Debate...")
     status_msg_id = sent["result"]["message_id"]
 
     def progress(text):
-        edit_message(chat_id, status_msg_id, f"{mode_text} | {text}", parse_mode=None)
+        edit_message(chat_id, status_msg_id, f"{mode_text} | {text}")
 
     try:
         image_b64 = fetch_image_b64(file_id)
     except Exception as e:
         logger.error(f"fetch image failed: {e}")
-        edit_message(chat_id, status_msg_id, "Не удалось загрузить фото. Попробуй ещё раз.", parse_mode=None)
+        edit_message(chat_id, status_msg_id, "❌ Не удалось загрузить фото. Попробуй ещё раз.")
         return
 
     try:
         rounds, verdict = run_debate(image_b64, mode, progress_cb=progress)
     except Exception as e:
         logger.error(f"debate failed: {e}")
-        edit_message(chat_id, status_msg_id, "Ошибка при анализе. Попробуй ещё раз.", parse_mode=None)
+        edit_message(chat_id, status_msg_id, "❌ Ошибка при анализе. Попробуй ещё раз.")
         return
 
     try:
@@ -456,7 +446,11 @@ def process_photo(chat_id, file_id, mode):
         pass
 
     summary = format_debate_summary(rounds)
-    send_message(chat_id, summary, parse_mode=None)
+    try:
+        send_message(chat_id, summary)
+    except Exception as e:
+        logger.error(f"send summary failed: {e}")
+        send_message(chat_id, summary, parse_mode=None)
 
     coords = extract_coords(verdict) if verdict else None
     if not coords:
@@ -466,15 +460,18 @@ def process_photo(chat_id, file_id, mode):
 
     if verdict:
         verdict_display = strip_coords_line(verdict)
-        final_text = f"ФИНАЛЬНЫЙ ВЕРДИКТ ОРАКУЛА\n\n{verdict_display}"
+        final_text = f"👁️ *ФИНАЛЬНЫЙ ВЕРДИКТ ОРАКУЛА*\n\n{verdict_display}"
         if coords:
-            final_text += f"\n\nКоординаты: {coords[0]:.5f}, {coords[1]:.5f}"
+            final_text += f"\n\n📍 Координаты: `{coords[0]:.5f}, {coords[1]:.5f}`"
     else:
-        final_text = "ФИНАЛЬНЫЙ ВЕРДИКТ\n\nСудья не смог вынести вердикт, но агенты высказались выше."
+        final_text = "👁️ *ФИНАЛЬНЫЙ ВЕРДИКТ*\n\n⚠️ Судья не смог вынести вердикт, но агенты высказались выше."
 
     kb = result_keyboard(coords[0], coords[1]) if coords else main_keyboard()
-    send_message(chat_id, final_text, kb, parse_mode=None)
-
+    try:
+        send_message(chat_id, final_text, kb)
+    except Exception as e:
+        logger.error(f"send verdict failed: {e}")
+        send_message(chat_id, final_text, kb, parse_mode=None)
 
 def handle_update(update):
     try:
@@ -485,18 +482,24 @@ def handle_update(update):
             if "text" in msg and msg["text"].startswith("/start"):
                 send_message(
                     chat_id,
-                    "GeoOracle — определяю локации по фото\n\n"
-                    "Работает система Multi-Agent Debate: 4 ИИ-агента спорят и "
-                    "находят локацию, а судья выносит финальный вердикт.\n\n"
-                    "Выбери режим работы:",
+                    "👁️ *GeoOracle* — определяю локации по фото\n\n"
+                    "🧠 Работает система *Multi-Agent Debate*: 4 ИИ-агента спорят и "
+                    "находят локацию, а судья выносит финальный вердикт.\n\nВыбери режим работы:",
                     main_keyboard(),
-                    parse_mode=None,
                 )
 
             elif "photo" in msg:
                 mode = user_mode.get(chat_id, "osint")
                 file_id = msg["photo"][-1]["file_id"]
-                process_photo(chat_id, file_id, mode)
+                threading.Thread(target=process_photo, args=(chat_id, file_id, mode), daemon=True).start()
+
+            elif "document" in msg:
+                doc = msg["document"]
+                mime = doc.get("mime_type", "")
+                if mime.startswith("image/"):
+                    mode = user_mode.get(chat_id, "osint")
+                    file_id = doc["file_id"]
+                    threading.Thread(target=process_photo, args=(chat_id, file_id, mode), daemon=True).start()
 
         elif "callback_query" in update:
             cb = update["callback_query"]
@@ -507,23 +510,22 @@ def handle_update(update):
 
             if data == "mode_geo":
                 user_mode[chat_id] = "geo"
-                edit_message(chat_id, message_id, "GeoGuessr режим\n\nОтправь скриншот из игры!\n\nЖду фото...", back_keyboard(), parse_mode=None)
+                edit_message(chat_id, message_id, "🎮 *GeoGuessr режим*\n\nОтправь скриншот из игры!\n\n📸 Жду фото...", back_keyboard())
             elif data == "mode_osint":
                 user_mode[chat_id] = "osint"
-                edit_message(chat_id, message_id, "OSINT режим\n\nОтправь любое фото!\n\nЖду фото...", back_keyboard(), parse_mode=None)
+                edit_message(chat_id, message_id, "🔍 *OSINT режим*\n\nОтправь любое фото!\n\n📸 Жду фото...", back_keyboard())
             elif data == "hints":
-                edit_message(chat_id, message_id, HINTS_TEXT, back_keyboard(), parse_mode=None)
+                edit_message(chat_id, message_id, HINTS_TEXT, back_keyboard())
             elif data == "back":
                 edit_message(
                     chat_id, message_id,
-                    "GeoOracle — определяю локации по фото\n\nВыбери режим работы:",
+                    "👁️ *GeoOracle* — определяю локации по фото\n\n"
+                    "🧠 Система *Multi-Agent Debate* готова к работе.\n\nВыбери режим работы:",
                     main_keyboard(),
-                    parse_mode=None,
                 )
 
     except Exception as e:
         logger.error(f"Error handling update: {e}")
-
 
 def poll():
     offset = 0
