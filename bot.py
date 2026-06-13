@@ -2,8 +2,6 @@ import base64
 import os
 import re
 import math
-import struct
-import io
 import urllib.request
 import urllib.parse
 import json
@@ -122,10 +120,6 @@ HINTS_TEXT = """💡 Гайд по визуальной геолокации (м
 
 user_mode = {}
 
-# ====
-#  TELEGRAM API
-# ====
-
 def tg_request(method, data):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     payload = json.dumps(data).encode()
@@ -177,10 +171,6 @@ def result_keyboard(lat=None, lon=None):
     rows.append([{"text": "◀️ Главное меню", "callback_data": "back"}])
     return {"inline_keyboard": rows}
 
-# ====
-#  OPENROUTER
-# ====
-
 def call_openrouter(model, messages, max_tokens=900, timeout=120):
     payload = json.dumps({
         "model": model,
@@ -201,14 +191,15 @@ def call_openrouter(model, messages, max_tokens=900, timeout=120):
         data = json.loads(r.read())
     return data["choices"][0]["message"]["content"]
 
-# ====
-#  КООРДИНАТЫ
-# ====
+# ✅ ИСПРАВЛЕНО: убран хардкод YouTube URL
+def fetch_image_b64(file_id):
+    file_info = tg_request("getFile", {"file_id": file_id})
+    file_path = file_info["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    with urllib.request.urlopen(file_url, timeout=60) as r:
+        return base64.b64encode(r.read()).decode()
 
-COORDS_RE = re.compile(
-    r"COORDS\s*[:：]?\s*\(?\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)",
-    re.IGNORECASE
-)
+COORDS_RE = re.compile(r"COORDS\s*[:：]?\s*\(?\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)", re.IGNORECASE)
 
 def extract_coords(text):
     if not text:
@@ -248,230 +239,6 @@ def strip_coords_line(text):
     lines = [ln for ln in text.splitlines() if not ln.strip().upper().startswith("COORDS")]
     return "\n".join(lines).strip()
 
-# ====
-#  EXIF
-# ====
-
-def _read_exif_ifd(data, offset, endian):
-    tags = {}
-    try:
-        count = struct.unpack_from(endian + "H", data, offset)[0]
-        offset += 2
-        for _ in range(count):
-            tag, typ, cnt = struct.unpack_from(endian + "HHI", data, offset)
-            val_offset = offset + 8
-            if typ == 2:
-                str_offset = struct.unpack_from(endian + "I", data, val_offset)[0]
-                raw = data[str_offset: str_offset + cnt]
-                tags[tag] = raw.rstrip(b"\x00").decode("utf-8", errors="replace")
-            elif typ == 5:
-                r_offset = struct.unpack_from(endian + "I", data, val_offset)[0]
-                num, den = struct.unpack_from(endian + "II", data, r_offset)
-                tags[tag] = (num, den)
-            elif typ == 3 and cnt == 1:
-                tags[tag] = struct.unpack_from(endian + "H", data, val_offset)[0]
-            offset += 12
-    except Exception:
-        pass
-    return tags
-
-def extract_exif(raw_bytes):
-    result = {}
-    try:
-        if raw_bytes[:2] != b"\xff\xd8":
-            return result
-        pos = 2
-        while pos < len(raw_bytes) - 1:
-            marker = raw_bytes[pos:pos+2]
-            if marker == b"\xff\xe1":
-                length = struct.unpack_from(">H", raw_bytes, pos + 2)[0]
-                app1 = raw_bytes[pos + 4: pos + 2 + length]
-                if app1[:6] != b"Exif\x00\x00":
-                    break
-                tiff = app1[6:]
-                endian = ">" if tiff[:2] == b"MM" else "<"
-                ifd0_offset = struct.unpack_from(endian + "I", tiff, 4)[0]
-                ifd0 = _read_exif_ifd(tiff, ifd0_offset, endian)
-                if 0x0132 in ifd0:
-                    result["datetime"] = ifd0[0x0132]
-                if 0x0110 in ifd0:
-                    result["camera"] = ifd0[0x0110]
-                if 0x010F in ifd0:
-                    result["make"] = ifd0[0x010F]
-                if 0x8825 in ifd0:
-                    gps_offset = ifd0[0x8825]
-                    if isinstance(gps_offset, tuple):
-                        gps_offset = gps_offset[0]
-                    gps = _read_exif_ifd(tiff, gps_offset, endian)
-                    def rational_to_deg(tag_id):
-                        val = gps.get(tag_id)
-                        if not val:
-                            return None
-                        try:
-                            r_offset = val if isinstance(val, int) else val[0]
-                            d_n, d_d = struct.unpack_from(endian + "II", tiff, r_offset)
-                            m_n, m_d = struct.unpack_from(endian + "II", tiff, r_offset + 8)
-                            s_n, s_d = struct.unpack_from(endian + "II", tiff, r_offset + 16)
-                            deg = d_n / d_d + (m_n / m_d) / 60 + (s_n / s_d) / 3600
-                            return round(deg, 6)
-                        except Exception:
-                            return None
-                    lat = rational_to_deg(2)
-                    lon = rational_to_deg(4)
-                    lat_ref = gps.get(1, "N")
-                    lon_ref = gps.get(3, "E")
-                    if lat is not None and lon is not None:
-                        if lat_ref == "S":
-                            lat = -lat
-                        if lon_ref == "W":
-                            lon = -lon
-                        result["gps_lat"] = lat
-                        result["gps_lon"] = lon
-                break
-            else:
-                if pos + 3 >= len(raw_bytes):
-                    break
-                seg_len = struct.unpack_from(">H", raw_bytes, pos + 2)[0]
-                pos += 2 + seg_len
-    except Exception as e:
-        logger.warning(f"EXIF parse error: {e}")
-    return result
-
-def format_exif_for_prompt(exif):
-    if not exif:
-        return ""
-    parts = []
-    if "datetime" in exif:
-        parts.append(f"Дата/время съёмки: {exif['datetime']}")
-    if "make" in exif or "camera" in exif:
-        cam = f"{exif.get('make', '')} {exif.get('camera', '')}".strip()
-        parts.append(f"Камера: {cam}")
-    if "gps_lat" in exif and "gps_lon" in exif:
-        parts.append(f"GPS из EXIF: {exif['gps_lat']:.5f}, {exif['gps_lon']:.5f}")
-    return "\n".join(parts)
-
-# ====
-#  URL ПАРСИНГ
-# ====
-
-URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-
-def extract_urls(text):
-    if not text:
-        return []
-    return URL_RE.findall(text)
-
-def fetch_url_context(url, max_chars=1500):
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; GeoOracle/1.0)"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = r.read(80000)
-            charset = "utf-8"
-            ct = r.headers.get("Content-Type", "")
-            m = re.search(r"charset=([\w-]+)", ct)
-            if m:
-                charset = m.group(1)
-            html = raw.decode(charset, errors="replace")
-
-        title = ""
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-        if m:
-            title = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
-
-        desc = ""
-        m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
-                      html, re.IGNORECASE)
-        if not m:
-            m = re.search(r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
-                          html, re.IGNORECASE)
-        if m:
-            desc = re.sub(r"\s+", " ", m.group(1)).strip()[:400]
-
-        og_desc = ""
-        m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']',
-                      html, re.IGNORECASE)
-        if not m:
-            m = re.search(r'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']og:description["\']',
-                          html, re.IGNORECASE)
-        if m:
-            og_desc = re.sub(r"\s+", " ", m.group(1)).strip()[:400]
-
-        parts = []
-        if title:
-            parts.append(f"Заголовок: {title}")
-        if desc:
-            parts.append(f"Описание: {desc}")
-        if og_desc and og_desc != desc:
-            parts.append(f"OG-описание: {og_desc}")
-
-        context = "\n".join(parts)
-        return context[:max_chars] if context else ""
-    except Exception as e:
-        logger.warning(f"fetch_url_context failed for {url}: {e}")
-        return ""
-
-# ====
-#  ПОГОДА
-# ====
-
-def get_weather(lat, lon):
-    try:
-        params = urllib.parse.urlencode({
-            "latitude": round(lat, 4),
-            "longitude": round(lon, 4),
-            "current": "temperature_2m,weathercode,windspeed_10m,precipitation,is_day",
-            "timezone": "auto",
-            "forecast_days": 1,
-        })
-        url = f"https://api.open-meteo.com/v1/forecast?{params}"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read())
-
-        cur = data.get("current", {})
-        tz_abbr = data.get("timezone_abbreviation", "")
-        cur_time = cur.get("time", "")
-        temp = cur.get("temperature_2m")
-        wcode = cur.get("weathercode")
-        wind = cur.get("windspeed_10m")
-        precip = cur.get("precipitation")
-        is_day = cur.get("is_day")
-
-        WMO = {
-            0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
-            45: "туман", 48: "изморозь",
-            51: "лёгкая морось", 53: "морось", 55: "сильная морось",
-            61: "лёгкий дождь", 63: "дождь", 65: "сильный дождь",
-            71: "лёгкий снег", 73: "снег", 75: "сильный снег",
-            80: "ливень", 81: "сильный ливень", 82: "очень сильный ливень",
-            95: "гроза", 96: "гроза с градом", 99: "сильная гроза с градом",
-        }
-        weather_desc = WMO.get(wcode, f"код {wcode}") if wcode is not None else "неизвестно"
-        day_night = "день" if is_day else "ночь"
-
-        parts = []
-        if cur_time:
-            parts.append(f"🕐 Местное время: {cur_time} ({tz_abbr})")
-        parts.append(f"🌤️ Погода сейчас: {weather_desc}")
-        if temp is not None:
-            parts.append(f"🌡️ Температура: {temp}°C")
-        if wind is not None:
-            parts.append(f"💨 Ветер: {wind} км/ч")
-        if precip is not None and precip > 0:
-            parts.append(f"🌧️ Осадки: {precip} мм")
-        parts.append(f"☀️ Время суток: {day_night}")
-
-        return "\n".join(parts)
-    except Exception as e:
-        logger.warning(f"get_weather failed: {e}")
-        return ""
-
-# ====
-#  АГЕНТЫ
-# ====
-
 def agent_system_prompt(agent):
     return (
         f"Ты — агент-специалист команды GeoOracle по определению геолокации по фотографии.\n"
@@ -480,16 +247,14 @@ def agent_system_prompt(agent):
         + OUTPUT_FORMAT
     )
 
-def run_agent(agent, image_b64, mode, others_text=None, round_num=1, extra_context=""):
+def run_agent(agent, image_b64, mode, others_text=None, round_num=1):
     sys_prompt = agent_system_prompt(agent)
+
     if round_num == 1:
-        base = (
+        user_text = (
             "Это скриншот из игры GeoGuessr. " if mode == "geo"
             else "Это фотография для OSINT-анализа. "
         ) + "Проанализируй фото со своей экспертной точки зрения и дай оценку локации."
-        if extra_context:
-            base += f"\n\n📎 ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ОТ ПОЛЬЗОВАТЕЛЯ:\n{extra_context}\n\nИспользуй этот контекст как дополнительные улики."
-        user_text = base
     else:
         user_text = (
             "Это РАУНД ДЕБАТОВ. Ниже — мнения других агентов-специалистов по этому же фото:\n\n"
@@ -517,12 +282,12 @@ def run_agent(agent, image_b64, mode, others_text=None, round_num=1, extra_conte
         result["error"] = str(e)
     return result
 
-def run_round_parallel(image_b64, mode, others_map=None, round_num=1, extra_context=""):
+def run_round_parallel(image_b64, mode, others_map=None, round_num=1):
     results = [None] * len(AGENTS)
 
     def worker(idx, agent):
         others_text = others_map.get(agent["id"]) if others_map else None
-        results[idx] = run_agent(agent, image_b64, mode, others_text, round_num, extra_context)
+        results[idx] = run_agent(agent, image_b64, mode, others_text, round_num)
 
     with ThreadPoolExecutor(max_workers=len(AGENTS)) as ex:
         futures = [ex.submit(worker, i, a) for i, a in enumerate(AGENTS)]
@@ -541,16 +306,9 @@ def build_others_map(results):
                 summary = strip_coords_line(r["text"])
                 coords = r["coords"]
                 coord_str = f" (координаты: {coords[0]:.4f}, {coords[1]:.4f})" if coords else ""
-                chunks.append(
-                    f"--- {r['agent']['emoji']} {r['agent']['name']} "
-                    f"({r['agent']['role']}){coord_str} ---\n{summary}"
-                )
+                chunks.append(f"--- {r['agent']['emoji']} {r['agent']['name']} ({r['agent']['role']}){coord_str} ---\n{summary}")
         others_map[agent["id"]] = "\n\n".join(chunks) if chunks else "Другие агенты не дали ответа."
     return others_map
-
-# ====
-#  СУДЬЯ
-# ====
 
 JUDGE_SYSTEM = (
     "Ты — ГЛАВНЫЙ СУДЬЯ команды GeoOracle по геолокации. "
@@ -597,18 +355,11 @@ def build_protocol(rounds):
             if r["text"]:
                 coords = r["coords"]
                 coord_str = f"\nКоординаты: {coords[0]:.4f}, {coords[1]:.4f}" if coords else ""
-                parts.append(
-                    f"{a['emoji']} {a['name']} ({a['role']}):\n"
-                    f"{strip_coords_line(r['text'])}{coord_str}"
-                )
+                parts.append(f"{a['emoji']} {a['name']} ({a['role']}):\n{strip_coords_line(r['text'])}{coord_str}")
             else:
                 parts.append(f"{a['emoji']} {a['name']} ({a['role']}): [нет ответа]")
         parts.append("")
     return "\n".join(parts)
-
-# ====
-#  ФОРМАТИРОВАНИЕ
-# ====
 
 def short_location(text):
     if not text:
@@ -646,22 +397,18 @@ def format_debate_summary(rounds):
             lines.append(f"{a['emoji']} *{a['name']}*: ⚠️ недоступен")
     return "\n".join(lines)
 
-# ====
-#  ДЕБАТЫ
-# ====
-
-def run_debate(image_b64, mode, progress_cb=None, extra_context=""):
+def run_debate(image_b64, mode, progress_cb=None):
     rounds = []
 
     if progress_cb:
         progress_cb("🧠 *Раунд 1/3*: агенты дают независимые оценки...")
-    r1 = run_round_parallel(image_b64, mode, round_num=1, extra_context=extra_context)
+    r1 = run_round_parallel(image_b64, mode, round_num=1)
     rounds.append((1, r1))
 
     if progress_cb:
         progress_cb("🔄 *Раунд 2/3*: агенты видят чужие аргументы и корректируют позиции...")
     others_map = build_others_map(r1)
-    r2 = run_round_parallel(image_b64, mode, others_map=others_map, round_num=2, extra_context=extra_context)
+    r2 = run_round_parallel(image_b64, mode, others_map=others_map, round_num=2)
     rounds.append((2, r2))
 
     coords2 = [r["coords"] for r in r2]
@@ -671,14 +418,12 @@ def run_debate(image_b64, mode, progress_cb=None, extra_context=""):
         if progress_cb:
             progress_cb(f"⚡ *Раунд 3/3*: сильные расхождения (~{int(disagreement)} км), финальная корректировка...")
         others_map3 = build_others_map(r2)
-        r3 = run_round_parallel(image_b64, mode, others_map=others_map3, round_num=3, extra_context=extra_context)
+        r3 = run_round_parallel(image_b64, mode, others_map=others_map3, round_num=3)
         rounds.append((3, r3))
 
     if progress_cb:
         progress_cb("⚖️ *Судья* анализирует все аргументы и выносит вердикт...")
     protocol = build_protocol(rounds)
-    if extra_context:
-        protocol = f"📎 КОНТЕКСТ ОТ ПОЛЬЗОВАТЕЛЯ:\n{extra_context}\n\n" + protocol
     try:
         verdict = run_judge(image_b64, protocol, mode)
     except Exception as e:
@@ -687,19 +432,7 @@ def run_debate(image_b64, mode, progress_cb=None, extra_context=""):
 
     return rounds, verdict
 
-# ====
-#  ОБРАБОТКА ФОТО
-# ====
-
-def fetch_image_raw(file_id):
-    file_info = tg_request("getFile", {"file_id": file_id})
-    file_path = file_info["result"]["file_path"]
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    with urllib.request.urlopen(file_url, timeout=60) as r:
-        raw = r.read()
-    return raw, base64.b64encode(raw).decode()
-
-def process_photo(chat_id, file_id, mode, caption=""):
+def process_photo(chat_id, file_id, mode):
     mode_text = "🎮 GeoGuessr" if mode == "geo" else "🔍 OSINT"
     sent = send_message(chat_id, f"{mode_text} | 👁️ Запускаю Multi-Agent Debate...")
     status_msg_id = sent["result"]["message_id"]
@@ -708,49 +441,14 @@ def process_photo(chat_id, file_id, mode, caption=""):
         edit_message(chat_id, status_msg_id, f"{mode_text} | {text}")
 
     try:
-        raw_bytes, image_b64 = fetch_image_raw(file_id)
+        image_b64 = fetch_image_b64(file_id)
     except Exception as e:
         logger.error(f"fetch image failed: {e}")
         edit_message(chat_id, status_msg_id, "❌ Не удалось загрузить фото. Попробуй ещё раз.")
         return
 
-    # EXIF
-    exif = extract_exif(raw_bytes)
-    exif_text = format_exif_for_prompt(exif)
-    logger.info(f"EXIF extracted: {exif}")
-
-    exif_coords = None
-    if "gps_lat" in exif and "gps_lon" in exif:
-        exif_coords = (exif["gps_lat"], exif["gps_lon"])
-
-    # URL-контекст из caption
-    url_context_parts = []
-    if caption:
-        urls = extract_urls(caption)
-        if urls:
-            progress("🔗 Загружаю контекст из ссылок...")
-            for url in urls[:2]:
-                ctx = fetch_url_context(url)
-                if ctx:
-                    url_context_parts.append(f"Источник ({url}):\n{ctx}")
-
-    # Собираем extra_context
-    extra_parts = []
-    if caption:
-        clean_caption = URL_RE.sub("", caption).strip()
-        if clean_caption:
-            extra_parts.append(f"Комментарий пользователя: {clean_caption}")
-    if exif_text:
-        extra_parts.append(f"EXIF метаданные фото:\n{exif_text}")
-    if url_context_parts:
-        extra_parts.extend(url_context_parts)
-    extra_context = "\n\n".join(extra_parts)
-
-    if exif_coords:
-        progress(f"📍 GPS из EXIF: {exif_coords[0]:.5f}, {exif_coords[1]:.5f} — передаю агентам...")
-
     try:
-        rounds, verdict = run_debate(image_b64, mode, progress_cb=progress, extra_context=extra_context)
+        rounds, verdict = run_debate(image_b64, mode, progress_cb=progress)
     except Exception as e:
         logger.error(f"debate failed: {e}")
         edit_message(chat_id, status_msg_id, "❌ Ошибка при анализе. Попробуй ещё раз.")
@@ -761,7 +459,6 @@ def process_photo(chat_id, file_id, mode, caption=""):
     except Exception:
         pass
 
-    # Краткая сводка дебатов
     summary = format_debate_summary(rounds)
     try:
         send_message(chat_id, summary)
@@ -769,33 +466,19 @@ def process_photo(chat_id, file_id, mode, caption=""):
         logger.error(f"send summary failed: {e}")
         send_message(chat_id, summary, parse_mode=None)
 
-    # Координаты: судья → EXIF → последний раунд
     coords = extract_coords(verdict) if verdict else None
-    if not coords and exif_coords:
-        coords = exif_coords
     if not coords:
         last_coords = [r["coords"] for r in rounds[-1][1] if r["coords"]]
         if last_coords:
             coords = last_coords[0]
-
-    # Погода
-    weather_text = ""
-    if coords:
-        weather_text = get_weather(coords[0], coords[1])
 
     if verdict:
         verdict_display = strip_coords_line(verdict)
         final_text = f"👁️ *ФИНАЛЬНЫЙ ВЕРДИКТ ОРАКУЛА*\n\n{verdict_display}"
         if coords:
             final_text += f"\n\n📍 Координаты: `{coords[0]:.5f}, {coords[1]:.5f}`"
-        if exif_coords:
-            final_text += f"\n📷 GPS из EXIF: `{exif_coords[0]:.5f}, {exif_coords[1]:.5f}`"
-        if weather_text:
-            final_text += f"\n\n🌍 *Погода в локации прямо сейчас:*\n{weather_text}"
     else:
         final_text = "👁️ *ФИНАЛЬНЫЙ ВЕРДИКТ*\n\n⚠️ Судья не смог вынести вердикт, но агенты высказались выше."
-        if weather_text and coords:
-            final_text += f"\n\n🌍 *Погода в предполагаемой локации:*\n{weather_text}"
 
     kb = result_keyboard(coords[0], coords[1]) if coords else main_keyboard()
     try:
@@ -803,10 +486,6 @@ def process_photo(chat_id, file_id, mode, caption=""):
     except Exception as e:
         logger.error(f"send verdict failed: {e}")
         send_message(chat_id, final_text, kb, parse_mode=None)
-
-# ====
-#  HANDLE UPDATE
-# ====
 
 def handle_update(update):
     try:
@@ -827,20 +506,22 @@ def handle_update(update):
             elif "photo" in msg:
                 mode = user_mode.get(chat_id, "osint")
                 file_id = msg["photo"][-1]["file_id"]
-                caption = msg.get("caption", "")
-                process_photo(chat_id, file_id, mode, caption=caption)
+                process_photo(chat_id, file_id, mode)
 
+            # ✅ ДОБАВЛЕНО: обработка документов (HEIC, файлы)
             elif "document" in msg:
                 doc = msg["document"]
                 mime = doc.get("mime_type", "")
-                if mime.startswith("image/"):
+                fname = doc.get("file_name", "").lower()
+                is_image = mime.startswith("image/") or any(
+                    fname.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp")
+                )
+                if is_image:
                     mode = user_mode.get(chat_id, "osint")
-                    file_id = doc["file_id"]
-                    caption = msg.get("caption", "")
-                    send_message(chat_id, "📎 Получил фото как файл — извлеку EXIF метаданные!")
-                    process_photo(chat_id, file_id, mode, caption=caption)
+                    send_message(chat_id, "📎 Получил фото как файл — анализирую!")
+                    process_photo(chat_id, doc["file_id"], mode)
                 else:
-                    send_message(chat_id, "⚠️ Поддерживаются только изображения.")
+                    send_message(chat_id, "❌ Поддерживаются только изображения. Отправь фото или файл JPG/PNG/HEIC.")
 
         elif "callback_query" in update:
             cb = update["callback_query"]
@@ -851,14 +532,10 @@ def handle_update(update):
 
             if data == "mode_geo":
                 user_mode[chat_id] = "geo"
-                edit_message(chat_id, message_id,
-                             "🎮 *GeoGuessr режим*\n\nОтправь скриншот из игры!\n\n📸 Жду фото...",
-                             back_keyboard())
+                edit_message(chat_id, message_id, "🎮 *GeoGuessr режим*\n\nОтправь скриншот из игры!\n\n📸 Жду фото...", back_keyboard())
             elif data == "mode_osint":
                 user_mode[chat_id] = "osint"
-                edit_message(chat_id, message_id,
-                             "🔍 *OSINT режим*\n\nОтправь любое фото!\n\n📸 Жду фото...",
-                             back_keyboard())
+                edit_message(chat_id, message_id, "🔍 *OSINT режим*\n\nОтправь любое фото!\n\n📸 Жду фото...", back_keyboard())
             elif data == "hints":
                 edit_message(chat_id, message_id, HINTS_TEXT, back_keyboard())
             elif data == "back":
@@ -872,10 +549,6 @@ def handle_update(update):
     except Exception as e:
         logger.error(f"Error handling update: {e}")
 
-# ====
-#  POLLING + HEALTH CHECK
-# ====
-
 def poll():
     offset = 0
     logger.info("Starting polling...")
@@ -884,9 +557,11 @@ def poll():
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
             with urllib.request.urlopen(url, timeout=40) as r:
                 data = json.loads(r.read())
+
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
                 threading.Thread(target=handle_update, args=(update,), daemon=True).start()
+
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(5)
