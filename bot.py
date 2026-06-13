@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import os
 import re
@@ -18,6 +17,12 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set!")
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY not set!")
+
+MODELS = [
+    "anthropic/claude-sonnet-4-6",
+    "google/gemini-2.5-pro",
+    "qwen/qwen2.5-vl-72b-instruct",
+]
 
 SYSTEM_PROMPT = """You are GeoOracle — an expert AI geolocator. Analyze photos using these methods:
 
@@ -47,7 +52,7 @@ Always respond in Russian. Structure EXACTLY like this:
 
 COORDS: [latitude], [longitude]
 
-IMPORTANT: Always end your response with the COORDS line. Use decimal degrees format (e.g. COORDS: 44.1598, 28.6348). If you cannot determine coordinates, use the city center coordinates."""
+IMPORTANT: Always end your response with the COORDS line in decimal degrees (e.g. COORDS: 44.1598, 28.6348). If unsure, use city center coordinates."""
 
 HINTS_TEXT = """💡 Гайд по визуальной геолокации (метод Rainbolt)
 
@@ -69,6 +74,8 @@ HINTS_TEXT = """💡 Гайд по визуальной геолокации (м
 🛣️ Разметка: жёлтые линии → Америка/Азия, белые → Европа"""
 
 user_mode = {}
+# Хранит последний file_id фото для кнопки "Пересчитать"
+user_last_photo = {}
 
 def tg_request(method, data):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
@@ -102,25 +109,58 @@ def main_keyboard():
 def back_keyboard():
     return {"inline_keyboard": [[{"text": "◀️ Главное меню", "callback_data": "back"}]]}
 
+def result_keyboard(coords=None):
+    rows = []
+    if coords:
+        lat, lon = coords
+        maps_url = f"https://www.google.com/maps?q={lat},{lon}"
+        rows.append([{"text": "🗺️ Открыть на карте", "url": maps_url}])
+    rows.append([{"text": "🔄 Пересчитать", "callback_data": "reanalyze"}])
+    rows.append([{"text": "◀️ Главное меню", "callback_data": "back"}])
+    return {"inline_keyboard": rows}
+
 def extract_coords(text):
-    match = re.search(r'COORDS:\s*([-\d.]+),\s*([-\d.]+)', text)
+    match = re.search(r"COORDS:\s*([-\d.]+),\s*([-\d.]+)", text)
     if match:
         return float(match.group(1)), float(match.group(2))
     return None
 
-def result_keyboard(coords=None):
-    buttons = [
-        [{"text": "🎮 GeoGuessr режим", "callback_data": "mode_geo"}],
-        [{"text": "🔍 OSINT режим", "callback_data": "mode_osint"}],
-        [{"text": "💡 Как искать локацию", "callback_data": "hints"}],
-    ]
-    if coords:
-        lat, lon = coords
-        maps_url = f"https://maps.google.com/?q={lat},{lon}"
-        buttons.insert(0, [{"text": "🗺️ Открыть на карте", "url": maps_url}])
-    return {"inline_keyboard": buttons}
+def extract_country(text):
+    """Извлекает страну из ответа модели для голосования."""
+    match = re.search(r"Страна:\s*(.+)", text)
+    if match:
+        return match.group(1).strip().lower()
+    return None
 
-def analyze_photo(file_id, mode):
+def call_model(model, image_b64, user_content, results, index):
+    """Запрос к одной модели, результат пишется в results[index]."""
+    try:
+        payload = json.dumps({
+            "model": model,
+            "max_tokens": 1000,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                    {"type": "text", "text": user_content}
+                ]}
+            ]
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=payload,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read())
+        results[index] = data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Model {model} error: {e}")
+        results[index] = None
+
+def analyze_photo_consensus(file_id, mode):
+    """Запрашивает 3 модели параллельно и возвращает итоговый текст + координаты."""
     file_info = tg_request("getFile", {"file_id": file_id})
     file_path = file_info["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
@@ -131,27 +171,50 @@ def analyze_photo(file_id, mode):
     user_content = "Определи локацию максимально точно." if mode == "osint" else \
                    "Это скриншот из GeoGuessr. Определи страну, регион и дай подсказки."
 
-    payload = json.dumps({
-        "model": "anthropic/claude-sonnet-4-6",
-        "max_tokens": 1000,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text", "text": user_content}
-            ]}
-        ]
-    }).encode()
+    results = [None] * len(MODELS)
+    threads = []
+    for i, model in enumerate(MODELS):
+        t = threading.Thread(target=call_model, args=(model, image_b64, user_content, results, i))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=payload,
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=90) as r:
-        data = json.loads(r.read())
+    # Голосование по стране
+    countries = [extract_country(r) for r in results if r]
+    valid_results = [r for r in results if r]
 
-    return data["choices"][0]["message"]["content"]
+    if not valid_results:
+        return "❌ Все модели не ответили. Попробуй ещё раз.", None
+
+    # Считаем голоса
+    country_votes = {}
+    for c in countries:
+        if c:
+            country_votes[c] = country_votes.get(c, 0) + 1
+
+    best_country = max(country_votes, key=country_votes.get) if country_votes else None
+    votes = country_votes.get(best_country, 0) if best_country else 0
+    total = len(valid_results)
+
+    # Берём ответ Claude как основной (индекс 0), если он есть
+    main_result = results[0] if results[0] else valid_results[0]
+
+    # Убираем строку COORDS из текста для пользователя
+    clean_result = re.sub(r"\nCOORDS:.*", "", main_result).strip()
+
+    # Координаты берём из основного ответа
+    coords = extract_coords(main_result)
+
+    # Формируем шапку консенсуса
+    if votes == total:
+        consensus_header = f"✅ *Консенсус ({votes}/{total}):* все модели согласны\n\n"
+    elif votes >= 2:
+        consensus_header = f"⚠️ *Частичный консенсус ({votes}/{total}):* большинство согласно\n\n"
+    else:
+        consensus_header = f"❌ *Расхождение ({votes}/{total}):* модели не сошлись\n\n"
+
+    return consensus_header + clean_result, coords
 
 def handle_update(update):
     try:
@@ -165,16 +228,15 @@ def handle_update(update):
             elif "photo" in msg:
                 mode = user_mode.get(chat_id, "osint")
                 mode_text = "🎮 GeoGuessr" if mode == "geo" else "🔍 OSINT"
-                sent = send_message(chat_id, f"{mode_text} | 👁️ Анализирую фото...")
+                sent = send_message(chat_id, f"{mode_text} | 👁️ Анализирую фото тремя моделями...")
 
                 file_id = msg["photo"][-1]["file_id"]
-                result = analyze_photo(file_id, mode)
+                user_last_photo[chat_id] = (file_id, mode)
 
-                coords = extract_coords(result)
-                clean_result = re.sub(r'\n*COORDS:.*$', '', result, flags=re.MULTILINE).strip()
+                result_text, coords = analyze_photo_consensus(file_id, mode)
 
                 tg_request("deleteMessage", {"chat_id": chat_id, "message_id": sent["result"]["message_id"]})
-                send_message(chat_id, clean_result, result_keyboard(coords))
+                send_message(chat_id, result_text, result_keyboard(coords))
 
         elif "callback_query" in update:
             cb = update["callback_query"]
@@ -193,6 +255,15 @@ def handle_update(update):
                 edit_message(chat_id, message_id, HINTS_TEXT, back_keyboard())
             elif data == "back":
                 edit_message(chat_id, message_id, "👁️ *GeoOracle* — определяю локации по фото\n\nВыбери режим работы:", main_keyboard())
+            elif data == "reanalyze":
+                if chat_id in user_last_photo:
+                    file_id, mode = user_last_photo[chat_id]
+                    mode_text = "🎮 GeoGuessr" if mode == "geo" else "🔍 OSINT"
+                    edit_message(chat_id, message_id, f"{mode_text} | 🔄 Пересчитываю тремя моделями...")
+                    result_text, coords = analyze_photo_consensus(file_id, mode)
+                    edit_message(chat_id, message_id, result_text, result_keyboard(coords))
+                else:
+                    answer_callback(cb["id"])
 
     except Exception as e:
         logger.error(f"Error handling update: {e}")
