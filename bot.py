@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import re
 import urllib.request
 import json
 import logging
@@ -42,7 +43,11 @@ Always respond in Russian. Structure EXACTLY like this:
 [3-5 personalized clues YOU noticed in THIS specific photo]
 
 🗺️ КАК НАЙТИ ТОЧНЕЕ:
-[3 specific tips for THIS photo to narrow down location]"""
+[3 specific tips for THIS photo to narrow down location]
+
+COORDS: [latitude], [longitude]
+
+IMPORTANT: Always end your response with the COORDS line. Use decimal degrees format (e.g. COORDS: 44.1598, 28.6348). If you cannot determine coordinates, use the city center coordinates."""
 
 HINTS_TEXT = """💡 Гайд по визуальной геолокации (метод Rainbolt)
 
@@ -97,11 +102,29 @@ def main_keyboard():
 def back_keyboard():
     return {"inline_keyboard": [[{"text": "◀️ Главное меню", "callback_data": "back"}]]}
 
+def extract_coords(text):
+    match = re.search(r'COORDS:\s*([-\d.]+),\s*([-\d.]+)', text)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+    return None
+
+def result_keyboard(coords=None):
+    buttons = [
+        [{"text": "🎮 GeoGuessr режим", "callback_data": "mode_geo"}],
+        [{"text": "🔍 OSINT режим", "callback_data": "mode_osint"}],
+        [{"text": "💡 Как искать локацию", "callback_data": "hints"}],
+    ]
+    if coords:
+        lat, lon = coords
+        maps_url = f"https://maps.google.com/?q={lat},{lon}"
+        buttons.insert(0, [{"text": "🗺️ Открыть на карте", "url": maps_url}])
+    return {"inline_keyboard": buttons}
+
 def analyze_photo(file_id, mode):
     file_info = tg_request("getFile", {"file_id": file_id})
     file_path = file_info["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    
+
     with urllib.request.urlopen(file_url) as r:
         image_b64 = base64.b64encode(r.read()).decode()
 
@@ -127,7 +150,7 @@ def analyze_photo(file_id, mode):
     )
     with urllib.request.urlopen(req, timeout=90) as r:
         data = json.loads(r.read())
-    
+
     return data["choices"][0]["message"]["content"]
 
 def handle_update(update):
@@ -135,20 +158,23 @@ def handle_update(update):
         if "message" in update:
             msg = update["message"]
             chat_id = msg["chat"]["id"]
-            
+
             if "text" in msg and msg["text"] == "/start":
                 send_message(chat_id, "👁️ *GeoOracle* — определяю локации по фото\n\nВыбери режим работы:", main_keyboard())
-            
+
             elif "photo" in msg:
                 mode = user_mode.get(chat_id, "osint")
                 mode_text = "🎮 GeoGuessr" if mode == "geo" else "🔍 OSINT"
                 sent = send_message(chat_id, f"{mode_text} | 👁️ Анализирую фото...")
-                
+
                 file_id = msg["photo"][-1]["file_id"]
                 result = analyze_photo(file_id, mode)
-                
+
+                coords = extract_coords(result)
+                clean_result = re.sub(r'\n*COORDS:.*$', '', result, flags=re.MULTILINE).strip()
+
                 tg_request("deleteMessage", {"chat_id": chat_id, "message_id": sent["result"]["message_id"]})
-                send_message(chat_id, result, main_keyboard())
+                send_message(chat_id, clean_result, result_keyboard(coords))
 
         elif "callback_query" in update:
             cb = update["callback_query"]
@@ -179,11 +205,11 @@ def poll():
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
             with urllib.request.urlopen(url, timeout=40) as r:
                 data = json.loads(r.read())
-            
+
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
                 threading.Thread(target=handle_update, args=(update,), daemon=True).start()
-        
+
         except Exception as e:
             logger.error(f"Polling error: {e}")
             import time
@@ -199,7 +225,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     logger.info("Starting GeoOracle bot...")
-    # Start health check server for Render
     server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info("Health server started")
