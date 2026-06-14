@@ -20,7 +20,12 @@ if not BOT_TOKEN:
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY not set!")
 
-MODEL_ID = "google/gemma-4-31b-it:free"
+MODELS_FALLBACK = [
+    "google/gemma-4-31b-it:free",
+    "meta-llama/llama-4-scout:free",
+    "mistralai/mistral-small-3.2-24b-instruct:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+]
 
 GEO_KNOWLEDGE_BASE = """
 === БАЗА ЗНАНИЙ ГЕОЛОКАЦИИ ===
@@ -265,6 +270,31 @@ def get_weather_info(lat, lon):
         return ""
 
 
+def call_model(model_id, system_prompt, img_b64):
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                {"type": "text", "text": "Найди это место."}
+            ]}
+        ]
+    }
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://geooracle-bot.onrender.com",
+            "X-Title": "GeoOracle"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())["choices"][0]["message"]["content"]
+
+
 def analyze(chat_id, file_id, mode):
     status = tg_api("sendMessage", {"chat_id": chat_id, "text": "🛰 Анализирую фото..."})
 
@@ -276,30 +306,30 @@ def analyze(chat_id, file_id, mode):
         ) as r:
             img_b64 = base64.b64encode(r.read()).decode()
 
-        payload = {
-            "model": MODEL_ID,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPTS[mode]},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text", "text": "Найди это место."}
-                ]}
-            ]
-        }
+        full_text = None
+        used_model = None
 
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://geooracle-bot.onrender.com",
-                "X-Title": "GeoOracle"
-            }
-        )
+        for model_id in MODELS_FALLBACK:
+            try:
+                logger.info(f"Trying model: {model_id}")
+                full_text = call_model(model_id, SYSTEM_PROMPTS[mode], img_b64)
+                used_model = model_id
+                logger.info(f"Success with model: {model_id}")
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 402, 503):
+                    logger.warning(f"Model {model_id} failed with {e.code}, trying next...")
+                    time.sleep(2)
+                    continue
+                else:
+                    raise
+            except Exception as e:
+                logger.warning(f"Model {model_id} error: {e}, trying next...")
+                time.sleep(2)
+                continue
 
-        with urllib.request.urlopen(req, timeout=60) as r:
-            full_text = json.loads(r.read())["choices"][0]["message"]["content"]
+        if not full_text:
+            raise Exception("All models failed")
 
         coords = extract_coords(full_text)
         clean_text = re.sub(r"COORDS\s*[:：]\s*-?\d+\.?\d*\s*,\s*-?\d+\.?\d*", "", full_text, flags=re.IGNORECASE).strip()
@@ -321,26 +351,13 @@ def analyze(chat_id, file_id, mode):
 
         tg_api("sendMessage", {"chat_id": chat_id, "text": final_text, "reply_markup": kb})
 
-    except urllib.error.HTTPError as e:
-        logger.error(f"HTTP Error {e.code}: {e.reason}")
-        try:
-            tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status["result"]["message_id"]})
-        except:
-            pass
-        if e.code == 402:
-            tg_api("sendMessage", {"chat_id": chat_id, "text": "❌ Нет баланса на OpenRouter. Пополни счёт на openrouter.ai"})
-        elif e.code == 429:
-            tg_api("sendMessage", {"chat_id": chat_id, "text": "⏳ Слишком много запросов. Подожди минуту и попробуй снова."})
-        else:
-            tg_api("sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка API: {e.code}. Попробуй позже."})
-
     except Exception as e:
         logger.exception("Analyze error")
         try:
             tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status["result"]["message_id"]})
         except:
             pass
-        tg_api("sendMessage", {"chat_id": chat_id, "text": "❌ Что-то пошло не так. Попробуй ещё раз."})
+        tg_api("sendMessage", {"chat_id": chat_id, "text": "❌ Все модели недоступны. Попробуй через минуту."})
 
 
 def handle_update(up):
