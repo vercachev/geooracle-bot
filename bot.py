@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
-MODEL_ID = "anthropic/claude-sonnet-4-6"
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not set!")
+if not OPENROUTER_API_KEY:
+    raise ValueError("OPENROUTER_API_KEY not set!")
+
+MODEL_ID = "google/gemma-4-31b-it:free"
 
 SYSTEM_PROMPTS = {
     "geo": """Ты эксперт по визуальной геолокации. Это скриншот из GeoGuessr — определи место максимально точно.
@@ -74,7 +79,7 @@ COORDS: lat, lon"""
 HINTS_TEXT = """💡 Гайд по визуальной геолокации
 
 🪵 Столбы:
-• Дырки в бетонных столбах → часто Венгрия/Румыния
+• Дырки в бетонных столбах → Венгрия/Румыния
 • Чёрно-оранжевые основания → Таиланд
 • Жёлто-чёрные полосы → Корея/Япония
 
@@ -104,7 +109,6 @@ WEATHER_CODES = {
     80: "🌧 Ливень", 95: "⛈ Гроза", 96: "⛈ Гроза с градом", 99: "⛈ Сильная гроза с градом"
 }
 
-# Хранилище режимов пользователей
 user_mode = {}
 
 
@@ -119,7 +123,7 @@ def tg_api(method, data=None):
         return json.loads(r.read())
 
 
-def main_menu(chat_id, text="Выбери режим:"):
+def main_menu(chat_id, text="👁 GeoOracle\n\nВыбери режим:"):
     tg_api("sendMessage", {
         "chat_id": chat_id,
         "text": text,
@@ -134,7 +138,7 @@ def main_menu(chat_id, text="Выбери режим:"):
 def extract_coords(text):
     if not text:
         return None
-    m = re.search(r"COORDS\s*[:：]\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)", text, re.IGNORECASE)
+    m = re.search(r"COORDS\s*[:：]\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)", text, re.IGNORECASE)
     if m:
         try:
             return (float(m.group(1)), float(m.group(2)))
@@ -170,8 +174,8 @@ def get_weather_info(lat, lon):
             f"\n\n🌤 Погода: {desc}, {temp}°C"
             f"\n💨 Ветер: {wind} км/ч"
             f"\n🕐 Местное время: {local_time} (UTC{sign}{offset})"
-            f"\n🌅 Восход: {fmt(res.get('sunrise','?'))}"
-            f"\n🌇 Закат: {fmt(res.get('sunset','?'))}"
+            f"\n🌅 Восход: {fmt(res.get('sunrise', '?'))}"
+            f"\n🌇 Закат: {fmt(res.get('sunset', '?'))}"
         )
     except Exception as e:
         logger.error(f"Weather error: {e}")
@@ -184,7 +188,9 @@ def analyze(chat_id, file_id, mode):
     try:
         f_info = tg_api("getFile", {"file_id": file_id})
         f_path = f_info["result"]["file_path"]
-        with urllib.request.urlopen(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f_path}") as r:
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f_path}", timeout=30
+        ) as r:
             img_b64 = base64.b64encode(r.read()).decode()
 
         payload = {
@@ -201,14 +207,19 @@ def analyze(chat_id, file_id, mode):
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
             data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://geooracle-bot.onrender.com",
+                "X-Title": "GeoOracle"
+            }
         )
 
         with urllib.request.urlopen(req, timeout=60) as r:
             full_text = json.loads(r.read())["choices"][0]["message"]["content"]
 
         coords = extract_coords(full_text)
-        clean_text = full_text.split("COORDS:")[0].strip()
+        clean_text = re.sub(r"COORDS\s*[:：]\s*-?\d+\.?\d*\s*,\s*-?\d+\.?\d*", "", full_text, flags=re.IGNORECASE).strip()
         weather = get_weather_info(coords[0], coords[1]) if coords else ""
         final_text = clean_text + weather
 
@@ -218,15 +229,35 @@ def analyze(chat_id, file_id, mode):
                 "text": "🗺 Открыть на карте",
                 "url": f"https://www.google.com/maps?q={coords[0]},{coords[1]}"
             }])
-        kb["inline_keyboard"].append([{"text": "🔄 Новое фото", "callback_data": "back"}])
         kb["inline_keyboard"].append([{"text": "◀️ Главное меню", "callback_data": "back"}])
 
-        tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status["result"]["message_id"]})
+        try:
+            tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status["result"]["message_id"]})
+        except:
+            pass
+
         tg_api("sendMessage", {"chat_id": chat_id, "text": final_text, "reply_markup": kb})
 
+    except urllib.error.HTTPError as e:
+        logger.error(f"HTTP Error {e.code}: {e.reason}")
+        try:
+            tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status["result"]["message_id"]})
+        except:
+            pass
+        if e.code == 402:
+            tg_api("sendMessage", {"chat_id": chat_id, "text": "❌ Нет баланса на OpenRouter. Пополни счёт на openrouter.ai"})
+        elif e.code == 429:
+            tg_api("sendMessage", {"chat_id": chat_id, "text": "⏳ Слишком много запросов. Подожди минуту и попробуй снова."})
+        else:
+            tg_api("sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка API: {e.code}. Попробуй позже."})
+
     except Exception as e:
-        logger.exception("Error")
-        tg_api("sendMessage", {"chat_id": chat_id, "text": "❌ Ошибка. Проверь баланс OpenRouter."})
+        logger.exception("Analyze error")
+        try:
+            tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status["result"]["message_id"]})
+        except:
+            pass
+        tg_api("sendMessage", {"chat_id": chat_id, "text": "❌ Что-то пошло не так. Попробуй ещё раз."})
 
 
 def handle_update(up):
@@ -235,10 +266,10 @@ def handle_update(up):
             msg = up["message"]
             chat_id = msg["chat"]["id"]
             if "text" in msg and msg["text"] == "/start":
-                main_menu(chat_id, "👁 GeoOracle\n\nВыбери режим:")
+                main_menu(chat_id)
             elif "photo" in msg:
-                mode = user_mode.get(chat_id, "geo")
-                threading.Thread(target=analyze, args=(chat_id, msg["photo"][-1]["file_id"], mode)).start()
+                mode = user_mode.get(chat_id, "osint")
+                threading.Thread(target=analyze, args=(chat_id, msg["photo"][-1]["file_id"], mode), daemon=True).start()
 
         elif "callback_query" in up:
             cb = up["callback_query"]
@@ -259,7 +290,7 @@ def handle_update(up):
                     "reply_markup": {"inline_keyboard": [[{"text": "◀️ Назад", "callback_data": "back"}]]}
                 })
             elif data == "back":
-                main_menu(chat_id, "Выбери режим:")
+                main_menu(chat_id)
 
     except Exception as e:
         logger.exception("Handle update error")
@@ -267,24 +298,29 @@ def handle_update(up):
 
 def poll():
     offset = 0
+    logger.info("GeoOracle started polling...")
     while True:
         try:
             res = tg_api("getUpdates", {"offset": offset, "timeout": 20})
             for up in res.get("result", []):
                 offset = up["update_id"] + 1
                 handle_update(up)
-        except:
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
             time.sleep(5)
 
 
 if __name__ == "__main__":
-    def run_h():
+    def run_health():
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"OK")
+            def log_message(self, *args):
+                pass
         HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), H).serve_forever()
 
-    threading.Thread(target=run_h, daemon=True).start()
+    threading.Thread(target=run_health, daemon=True).start()
+    logger.info("Health server started")
     poll()
