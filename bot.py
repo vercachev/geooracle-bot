@@ -61,7 +61,7 @@ GEO_KNOWLEDGE_BASE = """
 
 ЯЗЫКИ И ЗНАКИ:
 - Польша: Ł Ń Ż Ą Ę, нет буквы V
-- Венгрия: Ő Ű Cs Dz Gy
+- Венгрия/Румыния: Ő Ű Cs Dz Gy
 - Вьетнам: огромное количество диакритики (₫ ơ ư)
 - Турция: İ I Ğ Ş
 
@@ -307,13 +307,11 @@ def analyze(chat_id, file_id, mode):
             img_b64 = base64.b64encode(r.read()).decode()
 
         full_text = None
-        used_model = None
 
         for model_id in MODELS_FALLBACK:
             try:
                 logger.info(f"Trying model: {model_id}")
                 full_text = call_model(model_id, SYSTEM_PROMPTS[mode], img_b64)
-                used_model = model_id
                 logger.info(f"Success with model: {model_id}")
                 break
             except urllib.error.HTTPError as e:
@@ -398,6 +396,14 @@ def handle_update(up):
 
 def poll():
     offset = 0
+    logger.info("Waiting for old instance to die...")
+    # Сбрасываем конфликт — ждём пока старый инстанс умрёт
+    time.sleep(5)
+    try:
+        tg_api("getUpdates", {"offset": -1, "timeout": 1})
+    except:
+        pass
+    time.sleep(3)
     logger.info("GeoOracle started polling...")
     while True:
         try:
@@ -405,6 +411,13 @@ def poll():
             for up in res.get("result", []):
                 offset = up["update_id"] + 1
                 handle_update(up)
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                logger.warning("409 Conflict — waiting for old instance to die...")
+                time.sleep(10)
+            else:
+                logger.error(f"Polling HTTP error: {e}")
+                time.sleep(5)
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(5)
